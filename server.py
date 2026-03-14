@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from example.vector_databases.api_integration import register_vector_routes
+from api_integration import register_vector_routes
 
 # 添加当前目录到 python path 以便导入模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))

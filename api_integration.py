@@ -14,9 +14,11 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
-from .vector_db_manager import VectorDatabaseManager
-from .vector_retriever import VectorRetriever
-from .document_loader import DocumentLoader
+# 为了允许在未安装全部向量依赖的情况下启动后端，
+# 将向量相关模块改为延迟导入（在需要时再导入）
+VectorDatabaseManager = None
+VectorRetriever = None
+DocumentLoader = None
 
 # 创建蓝图
 vector_bp = Blueprint('vector', __name__, url_prefix='/api/vector')
@@ -41,9 +43,30 @@ def init_vector_system(
     embedding_model: str = None,
     dashscope_api_key: str = None
 ):
-    """初始化向量系统"""
-    global vector_manager, vector_retriever
-    
+    """初始化向量系统（延迟导入向量模块）"""
+    global vector_manager, vector_retriever, VectorDatabaseManager, VectorRetriever, DocumentLoader
+
+    # 延迟导入可能依赖较多的向量模块，避免在未安装全部依赖时阻塞应用启动
+    if VectorDatabaseManager is None or VectorRetriever is None:
+        try:
+            # 优先使用包内相对导入（python -m 启动）
+            from .vector_db_manager import VectorDatabaseManager as _VectorDatabaseManager
+            from .vector_retriever import VectorRetriever as _VectorRetriever
+            from .document_loader import DocumentLoader as _DocumentLoader
+        except Exception:
+            # 回退到绝对导入（python server.py 直接启动）
+            try:
+                from vector_db_manager import VectorDatabaseManager as _VectorDatabaseManager
+                from vector_retriever import VectorRetriever as _VectorRetriever
+                from document_loader import DocumentLoader as _DocumentLoader
+            except Exception as e:
+                logger.warning(f"无法导入向量模块，跳过初始化: {e}")
+                return False
+
+        VectorDatabaseManager = _VectorDatabaseManager
+        VectorRetriever = _VectorRetriever
+        DocumentLoader = _DocumentLoader
+
     try:
         vector_manager = VectorDatabaseManager(
             milvus_host=milvus_host,

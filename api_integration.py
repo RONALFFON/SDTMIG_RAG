@@ -6,6 +6,9 @@ API集成模块
 from flask import Blueprint, request, jsonify
 import os
 import logging
+import threading
+import time
+import uuid
 from typing import Dict, Any, List
 from werkzeug.utils import secure_filename
 from pathlib import Path
@@ -26,6 +29,8 @@ vector_bp = Blueprint('vector', __name__, url_prefix='/api/vector')
 # 全局变量存储向量系统实例
 vector_manager: VectorDatabaseManager = None
 vector_retriever: VectorRetriever = None
+upload_tasks: Dict[str, Dict[str, Any]] = {}
+upload_tasks_lock = threading.Lock()
 
 # 临时上传目录
 UPLOAD_FOLDER = '/tmp/vector_uploads'
@@ -35,6 +40,90 @@ if not os.path.exists(UPLOAD_FOLDER):
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def _cleanup_upload_tasks(max_age_seconds: int = 3600):
+    """清理过期任务，避免内存无限增长"""
+    now = time.time()
+    with upload_tasks_lock:
+        expired_task_ids = [
+            task_id
+            for task_id, task in upload_tasks.items()
+            if now - task.get('updated_at', now) > max_age_seconds
+        ]
+        for task_id in expired_task_ids:
+            upload_tasks.pop(task_id, None)
+
+
+def _set_upload_task(task_id: str, **updates):
+    """线程安全更新上传任务状态"""
+    with upload_tasks_lock:
+        task = upload_tasks.get(task_id, {})
+        task.update(updates)
+        task['updated_at'] = time.time()
+        upload_tasks[task_id] = task
+
+
+def _run_upload_task(task_id: str, file_path: str, filename: str, collection_name: str):
+    """后台执行文档解析和入库"""
+    global vector_manager
+
+    def progress_callback(progress: int, stage: str, extra: Dict[str, Any]):
+        _set_upload_task(
+            task_id,
+            status='processing',
+            progress=progress,
+            stage=stage,
+            detail=extra or {}
+        )
+
+    try:
+        _set_upload_task(
+            task_id,
+            status='processing',
+            progress=5,
+            stage='queued',
+            detail={'file_name': filename}
+        )
+
+        success = vector_manager.process_file(
+            file_path,
+            collection_name,
+            progress_callback=progress_callback
+        )
+        if success:
+            db_info = vector_manager.get_database_info(collection_name)
+            _set_upload_task(
+                task_id,
+                status='completed',
+                progress=100,
+                stage='completed',
+                message=f'文件上传并处理成功: {filename}',
+                database_info=db_info
+            )
+        else:
+            _set_upload_task(
+                task_id,
+                status='failed',
+                progress=100,
+                stage='failed',
+                message=f'文件处理失败: {filename}'
+            )
+    except Exception as e:
+        logger.error(f"后台文档处理失败: {e}")
+        _set_upload_task(
+            task_id,
+            status='failed',
+            progress=100,
+            stage='failed',
+            message=str(e)
+        )
+    finally:
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            logger.warning(f"无法删除临时文件: {file_path}")
 
 
 def init_vector_system(
@@ -139,7 +228,7 @@ def upload_document():
 
 @vector_bp.route('/upload_file', methods=['POST'])
 def upload_file():
-    """上传文件流处理"""
+    """上传文件流处理，并异步执行解析入库"""
     global vector_manager
     
     if not vector_manager:
@@ -158,26 +247,54 @@ def upload_file():
         filename = secure_filename(file.filename)
         file_path = os.path.join(UPLOAD_FOLDER, filename)
         file.save(file_path)
-        
-        try:
-            success = vector_manager.process_file(file_path, collection_name)
-            if success:
-                db_info = vector_manager.get_database_info(collection_name)
-                return jsonify({
-                    'success': True,
-                    'message': f'文件上传并处理成功: {filename}',
-                    'database_info': db_info
-                })
-            else:
-                 return jsonify({'success': False, 'message': '文件处理失败'}), 500
-        except Exception as e:
-             return jsonify({'success': False, 'message': str(e)}), 500
-        finally:
-            # 可选：处理完后删除临时文件，或者保留
-            # os.remove(file_path)
-            pass
+
+        task_id = uuid.uuid4().hex
+        _cleanup_upload_tasks()
+        _set_upload_task(
+            task_id,
+            upload_task_id=task_id,
+            status='queued',
+            progress=0,
+            stage='upload_received',
+            message='文件上传成功，开始解析入库',
+            collection_name=collection_name,
+            file_name=filename,
+            created_at=time.time()
+        )
+
+        worker = threading.Thread(
+            target=_run_upload_task,
+            args=(task_id, file_path, filename, collection_name),
+            daemon=True
+        )
+        worker.start()
+
+        return jsonify({
+            'success': True,
+            'accepted': True,
+            'task_id': task_id,
+            'message': '文件上传成功，后台正在解析入库',
+            'status': 'queued',
+            'progress': 0
+        }), 202
 
     return jsonify({'success': False, 'message': '上传失败'}), 500
+
+
+@vector_bp.route('/upload_task/<task_id>', methods=['GET'])
+def get_upload_task(task_id: str):
+    """查询上传入库任务进度"""
+    _cleanup_upload_tasks()
+    with upload_tasks_lock:
+        task = upload_tasks.get(task_id)
+
+    if not task:
+        return jsonify({'success': False, 'message': '任务不存在或已过期'}), 404
+
+    return jsonify({
+        'success': True,
+        'task': task
+    })
 
 
 @vector_bp.route('/query', methods=['POST'])
@@ -205,8 +322,12 @@ def query_documents():
         
         # 执行查询
         result = vector_retriever.answer_question(question, k=k, collection_name=collection_name)
-        
-        return jsonify({
+
+        degraded = getattr(result, 'degraded', False)
+        warning = getattr(result, 'warning', '')
+        error_code = getattr(result, 'error_code', '')
+
+        response_payload = {
             'success': True,
             'question': question,
             'answer': result.answer,
@@ -220,7 +341,16 @@ def query_documents():
                 }
                 for doc, score in zip(result.source_documents, result.scores)
             ]
-        })
+        }
+
+        if degraded:
+            response_payload['degraded'] = True
+            if warning:
+                response_payload['warning'] = warning
+            if error_code:
+                response_payload['error_code'] = error_code
+
+        return jsonify(response_payload)
         
     except Exception as e:
         logger.error(f"查询API错误: {str(e)}")

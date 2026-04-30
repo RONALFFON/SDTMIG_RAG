@@ -8,3 +8,4 @@ langchain-text-splitters
 pymilvus
 openai
 dashscope
+pypdf

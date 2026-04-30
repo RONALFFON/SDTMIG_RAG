@@ -1,7 +1,7 @@
 <template>
   <div class="app-layout">
     <!-- 侧边栏 -->
-    <aside class="sidebar">
+    <aside class="sidebar" :class="{ 'show': showSidebar }">
       <div class="logo-area">
         <div class="logo-icon">🧠</div>
         <h1>RAG 智能助手</h1>
@@ -49,12 +49,45 @@
           :loading="uploading" 
           @click="submitUpload"
         >
-          {{ uploading ? '正在解析入库...' : '立即解析入库' }}
+          {{ uploading ? (uploadProgress < 100 ? `正在上传 ${uploadProgress}%` : '正在解析入库...') : '立即解析入库' }}
         </el-button>
+
+        <div v-if="uploading && uploadProgress > 0" class="progress-box">
+          <el-progress 
+            :percentage="uploadProgress" 
+            :status="uploadSuccess ? 'success' : ''" 
+            :stroke-width="4" 
+            :show-text="true"
+          />
+          <div class="progress-stage">{{ uploadStageText }}</div>
+        </div>
 
         <div v-if="uploadSuccess" class="success-tip">
           <el-icon><CircleCheckFilled /></el-icon>
-          <span>入库成功，快去提问吧！</span>
+          <span :title="uploadSuccessMsg">{{ uploadSuccessMsg }}</span>
+        </div>
+        <div v-else-if="uploadFailed" class="error-tip">
+          <el-icon><CircleCloseFilled /></el-icon>
+          <span :title="uploadErrorMsg">{{ uploadErrorMsg }}</span>
+        </div>
+
+        <div class="collection-card">
+          <div class="collection-card__title">入库状态</div>
+          <div class="collection-card__row">
+            <span>集合</span>
+            <strong>{{ collectionName }}</strong>
+          </div>
+          <div class="collection-card__row">
+            <span>文档数</span>
+            <strong>{{ collectionInfo.documentCount }}</strong>
+          </div>
+          <div class="collection-card__row">
+            <span>状态</span>
+            <strong>{{ collectionInfo.statusText }}</strong>
+          </div>
+          <div v-if="collectionInfo.message" class="collection-card__message">
+            {{ collectionInfo.message }}
+          </div>
         </div>
       </div>
 
@@ -65,9 +98,13 @@
 
     <!-- 主聊天区域 -->
     <main class="chat-main">
+      <!-- 移动端遮罩 -->
+      <div v-if="showSidebar && isMobile" class="mobile-overlay" @click="showSidebar = false"></div>
+
       <!-- 顶部导航 -->
       <header class="chat-header">
         <div class="header-info">
+          <el-button v-if="isMobile" circle icon="Menu" @click="showSidebar = true" class="menu-btn" />
           <h2>智能问答</h2>
           <span class="status-badge">
             <span class="status-dot"></span>
@@ -177,11 +214,11 @@
 </template>
 
 <script setup>
-import { ref, nextTick } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { 
   UploadFilled, User, Service, Position, Collection, 
-  CircleCheckFilled, Delete, Document, Search, ChatLineRound,
-  CollectionTag, ArrowDown
+  CircleCheckFilled, CircleCloseFilled, Delete, Document, Search, ChatLineRound,
+  CollectionTag, ArrowDown, Menu
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import axios from 'axios'
@@ -195,12 +232,47 @@ const collectionName = ref('agent_rag')
 const uploadRef = ref(null)
 const fileToUpload = ref(null)
 const uploading = ref(false)
+const uploadProgress = ref(0)
+const uploadStageText = ref('等待上传')
 const uploadSuccess = ref(false)
+const uploadFailed = ref(false)
+const uploadErrorMsg = ref('文件上传失败')
+const uploadSuccessMsg = ref('已上传')
+const activeUploadTaskId = ref('')
+const collectionInfo = ref({
+  documentCount: 0,
+  statusText: '未查询',
+  message: ''
+})
 
 const inputQuery = ref('')
 const messages = ref([])
 const thinking = ref(false)
 const messagesRef = ref(null)
+
+const showSidebar = ref(false)
+const isMobile = ref(false)
+
+const checkMobile = () => {
+  isMobile.value = window.innerWidth <= 768
+  if (!isMobile.value) {
+    showSidebar.value = false
+  }
+}
+
+onMounted(() => {
+  checkMobile()
+  window.addEventListener('resize', checkMobile)
+  fetchCollectionInfo()
+})
+
+onUnmounted(() => {
+  window.removeEventListener('resize', checkMobile)
+})
+
+watch(collectionName, () => {
+  fetchCollectionInfo()
+})
 
 // Markdown 渲染
 const renderMarkdown = (text) => {
@@ -218,14 +290,97 @@ const clearHistory = () => {
   messages.value = []
 }
 
+let ignoreNextFileChange = false
+
 // File Upload Logic
 const handleFileChange = (file) => {
+  if (ignoreNextFileChange) {
+    ignoreNextFileChange = false
+    return
+  }
+
+  if (!file?.raw) return
+
   fileToUpload.value = file.raw
   uploadSuccess.value = false
+  uploadFailed.value = false
+  uploadErrorMsg.value = '文件上传失败'
+  uploadSuccessMsg.value = '已上传'
+  uploadProgress.value = 0
+  uploadStageText.value = '等待上传'
 }
 
 const handleExceed = () => {
   ElMessage.warning('每次仅支持上传一个文件，请移除旧文件后再试')
+}
+
+const getStageText = (stage, detail = {}) => {
+  const stageMap = {
+    upload_received: '文件已接收，等待开始',
+    queued: '已进入队列，准备解析',
+    preparing: '正在准备文档',
+    parsing: `正在解析文档，共 ${detail.document_count || 0} 页/段`,
+    chunking: `正在切分并入库，共 ${detail.chunk_count || 0} 个分块`,
+    completed: '解析入库完成',
+    failed: '解析入库失败'
+  }
+  return stageMap[stage] || '正在处理...'
+}
+
+const fetchCollectionInfo = async () => {
+  try {
+    const response = await axios.get(`${API_BASE}/collection_info`, {
+      params: { collection_name: collectionName.value }
+    })
+    const dbInfo = response.data?.database_info || {}
+    collectionInfo.value = {
+      documentCount: dbInfo.document_count ?? 0,
+      statusText: dbInfo.error ? '连接异常' : ((dbInfo.document_count ?? 0) > 0 ? '已入库' : '待入库'),
+      message: dbInfo.error || ''
+    }
+  } catch (error) {
+    collectionInfo.value = {
+      documentCount: 0,
+      statusText: '查询失败',
+      message: error.response?.data?.message || '无法获取集合状态'
+    }
+  }
+}
+
+const pollUploadTask = async (taskId) => {
+  activeUploadTaskId.value = taskId
+
+  while (activeUploadTaskId.value === taskId) {
+    const response = await axios.get(`${API_BASE}/upload_task/${taskId}`)
+    const task = response.data?.task || {}
+    const backendProgress = Number(task.progress || 0)
+    uploadProgress.value = Math.min(99, 30 + Math.round(backendProgress * 0.7))
+    uploadStageText.value = getStageText(task.stage, task.detail)
+
+    if (task.status === 'completed') {
+      uploadProgress.value = 100
+      uploadStageText.value = '解析入库完成'
+      uploadSuccess.value = true
+      uploadFailed.value = false
+      uploadSuccessMsg.value = task.message || '文件上传并处理成功'
+      collectionInfo.value = {
+        documentCount: task.database_info?.document_count ?? collectionInfo.value.documentCount,
+        statusText: '已入库',
+        message: ''
+      }
+      return
+    }
+
+    if (task.status === 'failed') {
+      uploadFailed.value = true
+      uploadSuccess.value = false
+      uploadErrorMsg.value = task.message || '解析入库失败'
+      uploadStageText.value = '解析入库失败'
+      throw new Error(uploadErrorMsg.value)
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 1200))
+  }
 }
 
 const submitUpload = async () => {
@@ -235,7 +390,13 @@ const submitUpload = async () => {
   }
 
   uploading.value = true
+  uploadProgress.value = 0
   uploadSuccess.value = false
+  uploadFailed.value = false
+  uploadErrorMsg.value = '文件上传失败'
+  uploadSuccessMsg.value = '已上传'
+  uploadStageText.value = '正在上传文件...'
+  activeUploadTaskId.value = ''
 
   try {
     const formData = new FormData()
@@ -243,19 +404,40 @@ const submitUpload = async () => {
     formData.append('collection_name', collectionName.value)
     
     const response = await axios.post(`${API_BASE}/upload_file`, formData, {
-      headers: { 'Content-Type': 'multipart/form-data' }
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (progressEvent) => {
+        if (progressEvent.total) {
+          const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total)
+          uploadProgress.value = Math.min(30, Math.round(percentCompleted * 0.3))
+          uploadStageText.value = `正在上传文件 ${percentCompleted}%`
+        }
+      }
     })
 
-    if (response.data.success) {
-      ElMessage.success('上传并入库成功！')
-      uploadSuccess.value = true
-      uploadRef.value.clearFiles()
+    if (response.data.success && response.data.task_id) {
+      uploadStageText.value = '文件上传完成，开始解析入库...'
+      await pollUploadTask(response.data.task_id)
+      const msg = uploadSuccessMsg.value || response.data.message || '已上传'
+      ElMessage.success(msg)
+      ignoreNextFileChange = true
+      uploadRef.value?.clearFiles()
       fileToUpload.value = null
+    } else {
+      const errMsg = response.data.message || '文件上传失败'
+      ElMessage.error(errMsg)
+      uploadSuccess.value = false
+      uploadFailed.value = true
+      uploadErrorMsg.value = errMsg
     }
   } catch (error) {
     console.error(error)
-    ElMessage.error(error.response?.data?.message || '上传失败')
+    const errMsg = error.response?.data?.message || error.message || '文件上传失败，网络或服务器错误'
+    ElMessage.error(errMsg)
+    uploadSuccess.value = false
+    uploadFailed.value = true
+    uploadErrorMsg.value = errMsg
   } finally {
+    activeUploadTaskId.value = ''
     uploading.value = false
   }
 }
@@ -281,6 +463,9 @@ const sendMessage = async () => {
     })
 
     if (response.data.success) {
+      if (response.data.degraded && response.data.warning) {
+        ElMessage.warning(response.data.warning)
+      }
       messages.value.push({
         role: 'assistant',
         content: response.data.answer,
@@ -294,9 +479,10 @@ const sendMessage = async () => {
       })
     }
   } catch (error) {
+     const errMsg = error.response?.data?.message || '网络错误或服务不可用，请检查后端服务是否启动。'
      messages.value.push({
         role: 'assistant',
-        content: '网络错误或服务不可用，请检查后端服务是否启动。'
+        content: errMsg
       })
   } finally {
     thinking.value = false
@@ -326,22 +512,24 @@ const scrollToBottom = () => {
 
 /* 侧边栏样式 */
 .sidebar {
-  width: 320px;
+  width: clamp(250px, 25%, 350px);
   background: #1a1c23; /* 深色背景 */
   color: #fff;
   display: flex;
   flex-direction: column;
   box-shadow: 4px 0 15px rgba(0, 0, 0, 0.1);
   z-index: 10;
-  transition: all 0.3s ease;
+  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+  flex-shrink: 0;
 }
 
 .logo-area {
-  padding: 30px 20px;
+  padding: clamp(15px, 2vh, 30px) clamp(15px, 2vw, 20px);
   display: flex;
   align-items: center;
   gap: 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  transition: padding 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .logo-icon {
@@ -360,8 +548,9 @@ const scrollToBottom = () => {
 
 .sidebar-content {
   flex: 1;
-  padding: 20px;
+  padding: clamp(15px, 2vh, 20px);
   overflow-y: auto;
+  transition: padding 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .section-title {
@@ -437,6 +626,23 @@ const scrollToBottom = () => {
   box-shadow: 0 4px 12px rgba(64, 158, 255, 0.3);
 }
 
+.progress-box {
+  margin-top: 15px;
+  padding: 0 5px;
+}
+
+.progress-stage {
+  margin-top: 8px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.72);
+}
+
+:deep(.el-progress__text) {
+  color: rgba(255, 255, 255, 0.8) !important;
+  font-size: 13px !important;
+  min-width: 40px !important;
+}
+
 .success-tip {
   margin-top: 15px;
   padding: 10px;
@@ -449,8 +655,70 @@ const scrollToBottom = () => {
   font-size: 13px;
 }
 
+.success-tip span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 250px;
+}
+
+.error-tip {
+  margin-top: 15px;
+  padding: 10px;
+  background: rgba(245, 108, 108, 0.15);
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #f56c6c;
+  font-size: 13px;
+}
+
+.error-tip span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 250px;
+}
+
+.collection-card {
+  margin-top: 16px;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.collection-card__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.9);
+  margin-bottom: 10px;
+}
+
+.collection-card__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.7);
+}
+
+.collection-card__row strong {
+  color: #fff;
+  font-weight: 600;
+}
+
+.collection-card__message {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #e6a23c;
+}
+
 .sidebar-footer {
-  padding: 20px;
+  padding: clamp(15px, 2vh, 20px);
   text-align: center;
   border-top: 1px solid rgba(255, 255, 255, 0.1);
   color: rgba(255, 255, 255, 0.3);
@@ -464,22 +732,33 @@ const scrollToBottom = () => {
   flex-direction: column;
   background: #f5f7fa;
   position: relative;
+  min-width: 0;
 }
 
 .chat-header {
-  height: 70px;
+  height: clamp(50px, 8vh, 70px);
   background: #fff;
   border-bottom: 1px solid #e4e7ed;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 30px;
+  padding: 0 clamp(15px, 3vw, 40px);
   box-shadow: 0 2px 6px rgba(0, 0, 0, 0.02);
+  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.header-info {
+  display: flex;
+  align-items: center;
+}
+
+.menu-btn {
+  margin-right: 15px;
 }
 
 .header-info h2 {
-  margin: 0 0 5px 0;
-  font-size: 18px;
+  margin: 0 10px 0 0;
+  font-size: clamp(16px, 2vw, 18px);
   color: #303133;
 }
 
@@ -503,9 +782,10 @@ const scrollToBottom = () => {
 
 .messages-container {
   flex: 1;
-  padding: 30px;
+  padding: clamp(15px, 3vh, 30px) clamp(10px, 3vw, 40px);
   overflow-y: auto;
   scroll-behavior: smooth;
+  transition: padding 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 /* 欢迎屏幕 */
@@ -560,11 +840,13 @@ const scrollToBottom = () => {
 /* 消息气泡 */
 .message-row {
   display: flex;
-  gap: 15px;
-  margin-bottom: 30px;
-  max-width: 800px;
+  gap: clamp(10px, 2vw, 15px);
+  margin-bottom: clamp(15px, 3vh, 30px);
+  width: 100%;
+  max-width: clamp(280px, 75vw, 1000px);
   margin-left: auto;
   margin-right: auto;
+  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .message-row.user {
@@ -573,6 +855,7 @@ const scrollToBottom = () => {
 
 .avatar .el-avatar {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .avatar .assistant {
@@ -585,15 +868,17 @@ const scrollToBottom = () => {
 
 .message-content {
   max-width: 80%;
+  transition: max-width 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .bubble {
-  padding: 15px 20px;
+  padding: clamp(10px, 2vh, 15px) clamp(15px, 2vw, 20px);
   border-radius: 16px;
   font-size: 15px;
   line-height: 1.7;
   position: relative;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+  transition: padding 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .user .bubble {
@@ -683,23 +968,24 @@ const scrollToBottom = () => {
 
 /* 输入区域 */
 .input-wrapper {
-  padding: 20px 30px 30px 30px;
+  padding: clamp(10px, 2vh, 20px) clamp(10px, 3vw, 40px) clamp(15px, 4vh, 30px) clamp(10px, 3vw, 40px);
   background: #fff; /* 或保持透明，看设计 */
   background: linear-gradient(to top, #f5f7fa 80%, rgba(245, 247, 250, 0) 100%);
   display: flex;
   flex-direction: column;
   align-items: center;
+  transition: padding 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .input-box {
   width: 100%;
-  max-width: 800px;
+  max-width: clamp(280px, 75vw, 1000px);
   position: relative;
   background: #fff;
   border-radius: 24px;
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
   border: 1px solid #ebeef5;
-  transition: all 0.3s;
+  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
 }
 
 .input-box:focus-within {
@@ -789,5 +1075,49 @@ const scrollToBottom = () => {
 
 .user :deep(.bubble code) {
   background: rgba(255, 255, 255, 0.2);
+}
+@media screen and (max-width: 768px) {
+  .sidebar {
+    position: absolute;
+    height: 100%;
+    transform: translateX(-100%);
+    z-index: 100;
+  }
+  
+  .sidebar.show {
+    transform: translateX(0);
+  }
+  
+  .chat-main {
+    width: 100%;
+  }
+
+  .message-content {
+    max-width: 90%;
+  }
+  
+  .message-row {
+    max-width: 95%;
+  }
+
+  .status-badge {
+    display: none;
+  }
+}
+
+.mobile-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 99;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 </style>

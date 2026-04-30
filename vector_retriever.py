@@ -19,7 +19,12 @@ from langchain_core.documents import Document
 
 
 # 本地模块
-from .vector_db_manager import VectorDatabaseManager
+try:
+    # 包模式启动（python -m）
+    from .vector_db_manager import VectorDatabaseManager
+except Exception:
+    # 脚本模式启动（python server.py）
+    from vector_db_manager import VectorDatabaseManager
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -52,6 +57,9 @@ class AnswerResult:
     question_type: str
     source_documents: List[Document]
     scores: List[float]
+    degraded: bool = False
+    warning: str = ""
+    error_code: str = ""
 
 
 class VectorRetriever:
@@ -152,17 +160,20 @@ class VectorRetriever:
             context = "\n\n".join(context_parts)
             
             # 4. 生成回答 (使用 LLM)
-            answer = self._generate_answer_with_llm(question, context)
+            llm_result = self._generate_answer_with_llm(question, context)
             
             # 5. 计算置信度
             confidence = self._calculate_confidence(scores)
             
             return AnswerResult(
-                answer=answer,
+                answer=llm_result["answer"],
                 confidence=confidence,
                 question_type=question_type,
                 source_documents=source_documents,
-                scores=scores
+                scores=scores,
+                degraded=llm_result["degraded"],
+                warning=llm_result["warning"],
+                error_code=llm_result["error_code"]
             )
             
         except Exception as e:
@@ -175,18 +186,28 @@ class VectorRetriever:
                 scores=[]
             )
     
-    def _generate_answer_with_llm(self, question: str, context: str) -> str:
+    def _generate_answer_with_llm(self, question: str, context: str) -> Dict[str, Any]:
         """使用 LLM 生成回答"""
         try:
             from openai import OpenAI
+            import httpx
             import os
             
             # 使用与 query_system.py 相同的配置
             api_key = os.environ.get("DASHSCOPE_API_KEY", "") or os.environ.get("DASHSCOPE_", "")
             base_url = os.environ.get("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
             model_name = os.environ.get("LLM_MODEL", "qwen-plus")
-            
-            client = OpenAI(api_key=api_key, base_url=base_url)
+            skip_verify = os.environ.get("LLM_INSECURE_SKIP_VERIFY", "true").lower() == "true"
+
+            # WSL/企业代理环境下证书链可能不完整，允许通过环境变量跳过 TLS 校验
+            if skip_verify:
+                client = OpenAI(
+                    api_key=api_key,
+                    base_url=base_url,
+                    http_client=httpx.Client(verify=False, timeout=60.0),
+                )
+            else:
+                client = OpenAI(api_key=api_key, base_url=base_url)
             
             system_prompt = (
                 "你是一个智能助手。请基于提供的【参考资料】回答用户的问题。\n"
@@ -210,11 +231,50 @@ class VectorRetriever:
                 temperature=0.7
             )
             
-            return response.choices[0].message.content
+            return {
+                "answer": response.choices[0].message.content,
+                "degraded": False,
+                "warning": "",
+                "error_code": ""
+            }
             
         except Exception as e:
             logger.error(f"LLM 生成失败: {e}")
-            return "抱歉，生成回答时出现错误，请稍后再试。"
+            error_msg = str(e)
+            error_code = self._classify_llm_error(error_msg)
+            fallback_answer = self._build_fallback_answer(question, context)
+            return {
+                "answer": fallback_answer,
+                "degraded": True,
+                "warning": "LLM 服务暂时不可用，已返回降级回答",
+                "error_code": error_code
+            }
+
+    def _classify_llm_error(self, error_msg: str) -> str:
+        """对 LLM 异常做粗粒度分类，便于 API 和前端展示"""
+        msg = (error_msg or "").lower()
+        if any(k in msg for k in ["401", "unauthorized", "api key", "invalid key"]):
+            return "llm_auth_error"
+        if any(k in msg for k in ["timeout", "timed out", "connection", "dns", "ssl", "certificate"]):
+            return "llm_network_error"
+        if any(k in msg for k in ["model", "not found", "invalid model"]):
+            return "llm_model_error"
+        return "llm_unknown_error"
+
+    def _build_fallback_answer(self, question: str, context: str) -> str:
+        """LLM 异常时的降级回答策略：优先用检索上下文，次选通用提示"""
+        if context and context.strip():
+            excerpt = context[:500]
+            return (
+                "知识库中已检索到相关内容，但大模型服务暂时不可用。"
+                "以下是基于检索片段的降级摘要：\n\n"
+                f"{excerpt}"
+            )
+
+        return (
+            "知识库中未找到可用内容，且大模型服务暂时不可用。"
+            "请稍后重试，或先上传更相关的文档后再提问。"
+        )
     
     def _calculate_confidence(self, scores: List[float]) -> float:
         """

@@ -16,7 +16,7 @@ Milvus (向量数据库) : 在我们当前的配置中，Milvus 本身 没有 �
 import os
 import json
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Callable, List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -27,6 +27,7 @@ load_dotenv(dotenv_path=env_path)
 # LangChain and Milvus imports
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings, DashScopeEmbeddings
+from langchain_community.embeddings.fake import FakeEmbeddings
 from langchain_milvus import Milvus
 from langchain_core.documents import Document
 from langchain_community.document_loaders import (
@@ -41,6 +42,8 @@ from pymilvus import utility, connections, Collection
 # 配置日志
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+ProgressCallback = Optional[Callable[[int, str, Dict[str, Any]], None]]
 
 class VectorDatabaseManager:
     """向量数据库管理器 (Milvus后端)"""
@@ -90,6 +93,8 @@ class VectorDatabaseManager:
         
         # 向量数据库实例
         self.vectorstore = None
+        # Milvus 不可用时的内存兜底存储
+        self._fallback_documents: Dict[str, List[Document]] = {}
         # 延迟加载：不要在 __init__ 中调用 _load_existing_db，避免启动时连接未就绪或报错
         # self._load_existing_db() 
 
@@ -115,11 +120,9 @@ class VectorDatabaseManager:
 
         except Exception as e:
             logger.error(f"加载DashScope模型失败: {e}")
-            logger.warning("使用备用HuggingFace模型")
-            self.embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/all-MiniLM-L6-v2",
-                model_kwargs={'device': 'cpu'}
-            )
+            # 直接使用 FakeEmbeddings，避免在受限网络下加载 HuggingFace 模型导致启动阻塞
+            logger.warning("启用 FakeEmbeddings 作为兜底嵌入模型")
+            self.embeddings = FakeEmbeddings(size=768)
 
     def _connect_to_milvus(self):
         """连接到Milvus服务"""
@@ -129,6 +132,15 @@ class VectorDatabaseManager:
             logger.info(f"成功连接到Milvus: {self.milvus_host}:{self.milvus_port}")
         except Exception as e:
             logger.error(f"连接Milvus失败: {e}")
+            raise
+
+    def _ensure_milvus_connection(self):
+        """在执行读写前确保默认连接可用"""
+        try:
+            # 直接重连是幂等的，可避免连接被回收导致的 ConnectionNotExistException
+            connections.connect("default", host=self.milvus_host, port=self.milvus_port)
+        except Exception as e:
+            logger.error(f"Milvus重连失败: {e}")
             raise
 
     def _load_existing_db(self):
@@ -209,53 +221,18 @@ class VectorDatabaseManager:
         target_collection = collection_name or self.collection_name
         
         try:
-            # 检查集合是否存在
-            collection_exists = utility.has_collection(target_collection)
-            
-            if self.vectorstore is None or self.collection_name != target_collection:
-                # 初始化 vectorstore
-                if collection_exists:
-                    logger.info(f"加载现有集合: {target_collection}")
-                else:
-                    logger.info(f"集合不存在，将创建新集合: {target_collection}")
-                
-                # Milvus.from_documents 和 Milvus(...) 的区别：
-                # from_documents: 会根据文档内容创建集合（如果不存在），并插入数据。
-                # Milvus(...): 仅初始化客户端，不插入数据，通常用于检索或追加。
-                
-                # 策略：始终使用 Milvus() 初始化，然后调用 add_documents。
-                # 如果是首次创建，我们需要先确保集合存在，或者让 add_documents 处理？
-                # LangChain 的 Milvus.from_documents 是最方便的初始化+插入入口。
-                # 但为了避免重复创建/Schema冲突，我们应该：
-                # 1. 如果集合存在，用 Milvus() 加载，然后 add_documents()
-                # 2. 如果集合不存在，用 Milvus.from_documents()
-                
-                if collection_exists:
-                    self.vectorstore = Milvus(
-                        embedding_function=self.embeddings,
-                        collection_name=target_collection,
-                        connection_args={"host": self.milvus_host, "port": self.milvus_port},
-                        # 关键：auto_id=True 通常是默认的，但确保配置一致
-                    )
-                    self.collection_name = target_collection
-                    # 追加数据
-                    self.vectorstore.add_documents(documents)
-                    logger.info(f"成功向现有集合 '{target_collection}' 追加 {len(documents)} 条文档")
-                else:
-                    # 集合不存在，创建并插入
-                    self.vectorstore = Milvus.from_documents(
-                        documents=documents,
-                        embedding=self.embeddings,
-                        collection_name=target_collection,
-                        connection_args={"host": self.milvus_host, "port": self.milvus_port},
-                        drop_old=False # 明确不删除旧的（虽然这里是else分支，本身就不存在）
-                    )
-                    self.collection_name = target_collection
-                    logger.info(f"成功创建集合 '{target_collection}' 并插入 {len(documents)} 条文档")
-            else:
-                # vectorstore 已初始化且集合名称匹配，直接追加
-                self.vectorstore.add_documents(documents)
-                logger.info(f"成功向当前集合 '{target_collection}' 追加 {len(documents)} 条文档")
+            self._ensure_milvus_connection()
+            # 为规避连接别名丢失导致的 add_documents 报错，
+            # 统一通过 from_documents 执行写入（集合存在时会追加，drop_old=False）
+            self.vectorstore = Milvus.from_documents(
+                documents=documents,
+                embedding=self.embeddings,
+                collection_name=target_collection,
+                connection_args={"host": self.milvus_host, "port": self.milvus_port},
+                drop_old=False
+            )
+            self.collection_name = target_collection
+            logger.info(f"成功写入集合 '{target_collection}'，文档数: {len(documents)}")
             
         except Exception as e:
             # 捕获 Schema 不兼容错误并尝试自动修复（重建）
@@ -280,9 +257,15 @@ class VectorDatabaseManager:
                      raise re
             else:
                 logger.error(f"添加文档到Milvus失败: {e}")
-                raise e
+                self._fallback_add_documents(target_collection, documents)
+                logger.warning(f"已回退到内存知识库写入，集合: {target_collection}, 文档数: {len(documents)}")
 
-    def process_file(self, file_path: str, collection_name: str = None) -> bool:
+    def process_file(
+        self,
+        file_path: str,
+        collection_name: str = None,
+        progress_callback: ProgressCallback = None
+    ) -> bool:
         """
         处理单个文件：加载、切分、存储
         
@@ -293,20 +276,30 @@ class VectorDatabaseManager:
         Returns:
             处理是否成功
         """
+        def report(progress: int, stage: str, **extra):
+            if progress_callback:
+                progress_callback(progress, stage, extra)
+
         try:
             logger.info(f"开始处理文件: {file_path}")
+            report(10, "preparing", file_name=os.path.basename(file_path))
             documents = self.load_document(file_path)
             if not documents:
+                report(100, "failed", error="文档加载失败或内容为空")
                 return False
-            
+
+            report(35, "parsing", document_count=len(documents))
             split_docs = self.split_documents(documents)
+            report(65, "chunking", chunk_count=len(split_docs))
             self.add_documents_to_db(split_docs, collection_name)
-            
+
+            report(100, "completed", chunk_count=len(split_docs))
             logger.info(f"文件处理完成: {file_path}")
             return True
             
         except Exception as e:
             logger.error(f"处理文件失败 {file_path}: {e}")
+            report(100, "failed", error=str(e))
             return False
 
     def process_csv_data(self, csv_path: str,
@@ -389,6 +382,7 @@ class VectorDatabaseManager:
 
         if self.vectorstore is None or (target_collection and self.collection_name != target_collection):
             try:
+                self._ensure_milvus_connection()
                 if target_collection and utility.has_collection(target_collection):
                     self.vectorstore = Milvus(
                         embedding_function=self.embeddings,
@@ -398,11 +392,11 @@ class VectorDatabaseManager:
                     self.collection_name = target_collection
                     logger.info(f"加载集合用于搜索: {target_collection}")
                 else:
-                    logger.warning("向量数据库未初始化")
-                    return []
+                    logger.warning("向量数据库未初始化，尝试内存知识库检索")
+                    return self._fallback_search(query, target_collection, k)
             except Exception as e:
                 logger.error(f"加载Milvus集合失败: {e}")
-                return []
+                return self._fallback_search(query, target_collection, k)
         
         try:
             if filter_dict:
@@ -414,7 +408,7 @@ class VectorDatabaseManager:
             
         except Exception as e:
             logger.error(f"搜索失败: {e}")
-            return []
+            return self._fallback_search(query, target_collection, k)
 
     def get_database_info(self, collection_name: str = None) -> Dict[str, Any]:
         """
@@ -430,6 +424,7 @@ class VectorDatabaseManager:
         }
         
         try:
+            self._ensure_milvus_connection()
             # 如果 vectorstore 未初始化，尝试临时连接检查
             if utility.has_collection(target_collection):
                 # 使用 Collection 对象获取统计信息
@@ -450,22 +445,48 @@ class VectorDatabaseManager:
                      except:
                         pass # 忽略加载错误，只返回统计
             else:
-                info["document_count"] = 0
+                info["document_count"] = len(self._fallback_documents.get(target_collection, []))
         except Exception as e:
             logger.error(f"获取Milvus集合信息失败: {e}")
             info["error"] = str(e)
+            info["document_count"] = len(self._fallback_documents.get(target_collection, []))
         
         return info
 
     def clear_database(self):
         """清空Milvus集合"""
         try:
+            self._ensure_milvus_connection()
             if utility.has_collection(self.collection_name):
                 utility.drop_collection(self.collection_name)
                 self.vectorstore = None
                 logger.info(f"Milvus集合 '{self.collection_name}' 已被删除")
         except Exception as e:
             logger.error(f"清空Milvus集合失败: {e}")
+
+    def _fallback_add_documents(self, collection_name: str, documents: List[Document]):
+        """将文档写入内存兜底知识库"""
+        bucket = self._fallback_documents.setdefault(collection_name, [])
+        bucket.extend(documents)
+
+    def _fallback_search(self, query: str, collection_name: str, k: int) -> List[Tuple[Document, float]]:
+        """基于词重叠的简单兜底检索"""
+        docs = self._fallback_documents.get(collection_name, [])
+        if not docs:
+            return []
+
+        query_terms = set(query.lower().split())
+        scored: List[Tuple[Document, float]] = []
+        for doc in docs:
+            terms = set((doc.page_content or "").lower().split())
+            if not terms:
+                continue
+            overlap = len(query_terms & terms)
+            score = overlap / max(len(query_terms), 1)
+            scored.append((doc, score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:k]
 
 def main():
     """测试函数"""

@@ -9,6 +9,7 @@ __pycache__/
 
 rag_front/node_modules/
 rag_front/dist/
+.tools/
 .venv/
 .venv_wsl/
 volumes/

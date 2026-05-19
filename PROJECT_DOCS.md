@@ -82,7 +82,7 @@ graph LR
 前端主要负责展示界面，核心逻辑在后端。
 
 ```bash
-cd rag_front
+cd frontend
 npm install
 npm run dev
 ```

@@ -1,0 +1,4 @@
+upload 200
+{"database_info":{"collection_name":"agent_rag","document_count":0,"fallback_document_count":8282,"is_initialized":true,"last_write_backend":"fallback","last_write_error":"<ConnectionNotExistException: (code=1, message=should create connection first.)>","milvus_host":"127.0.0.1","milvus_port":"19530","storage_mode":"fallback_memory"},"message":"\u6587\u6863\u5904\u7406\u6210\u529f: /mnt/d/my_demo/SDTMIG_RAG/SDTMIG.pdf","success":true}
+
+{"database_info":{"collection_name":"agent_rag","document_count":0,"fallback_document_count":8282,"is_initialized":true,"last_write_backend":"fallback","last_write_error":"<ConnectionNotExistException: (code=1, message=should create connection first.)>","milvus_host":"127.0.0.1","milvus_port":"19530","storage_mode":"fallback_memory"},"success":true}

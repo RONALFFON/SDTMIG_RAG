@@ -1,15 +1,65 @@
+# ========================
+# Environment Variables
+# ========================
 .env
 .env.*
 !.env.example
 
+# ========================
+# Python
+# ========================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
 
-.DS_Store
-
-rag_front/node_modules/
-rag_front/dist/
-.tools/
+# ========================
+# Virtual Environments
+# ========================
 .venv/
 .venv_wsl/
+venv/
+env/
+
+# ========================
+# Node.js / Frontend
+# ========================
+frontend/node_modules/
+frontend/dist/
+frontend/vite.log
+
+# ========================
+# IDE & Tools
+# ========================
+.idea/
+.vscode/
+.claude/
+.tools/
+.trae/
+*.swp
+*.swo
+
+# ========================
+# Logs
+# ========================
+*.log
+backend_wsl.log
+debug.log
+run_main.log
+
+# ========================
+# Data & Uploads
+# ========================
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep
 volumes/
+milvus_data/
+
+# ========================
+# OS
+# ========================
+.DS_Store
+Thumbs.db
